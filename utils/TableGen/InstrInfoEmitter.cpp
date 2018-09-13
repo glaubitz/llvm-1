@@ -75,7 +75,8 @@ private:
   void emitRecord(const CodeGenInstruction &Inst, unsigned Num,
                   Record *InstrInfo,
                   std::map<std::vector<Record*>, unsigned> &EL,
-                  const OperandInfoMapTy &OpInfo,
+                  const OperandInfoMapTy &MIOpInfo,
+                  const OperandInfoMapTy &MCOpInfo,
                   raw_ostream &OS);
   void emitOperandTypesEnum(raw_ostream &OS, const CodeGenTarget &Target);
   void initOperandMapData(
@@ -87,8 +88,12 @@ private:
             ArrayRef<const CodeGenInstruction*> NumberedInstructions);
 
   // Operand information.
-  void EmitOperandInfo(raw_ostream &OS, OperandInfoMapTy &OperandInfoIDs);
-  std::vector<std::string> GetOperandInfo(const CodeGenInstruction &Inst);
+  void EmitMIOperandInfo(raw_ostream &OS, OperandInfoMapTy &MCOperandInfoIDs);
+  std::vector<std::string> GetMIOperandInfo(const CodeGenTarget &Target,
+                                            const CodeGenInstruction &Inst);
+
+  void EmitMCOperandInfo(raw_ostream &OS, OperandInfoMapTy &MCOperandInfoIDs);
+  std::vector<std::string> GetMCOperandInfo(const CodeGenInstruction &Inst);
 };
 
 } // end anonymous namespace
@@ -106,7 +111,62 @@ static void PrintDefList(const std::vector<Record*> &Uses,
 //===----------------------------------------------------------------------===//
 
 std::vector<std::string>
-InstrInfoEmitter::GetOperandInfo(const CodeGenInstruction &Inst) {
+InstrInfoEmitter::GetMIOperandInfo(const CodeGenTarget &Target,
+                                   const CodeGenInstruction &Inst) {
+
+  std::vector<std::string> Result;
+
+  const std::string &Namespace = Target.getInstNamespace();
+
+  for (auto &Op : Inst.Operands) {
+
+    // One record
+    std::string Res;
+
+    // This might be a multiple operand thing.  Targets like X86 have
+    // registers in their multi-operand operands.  It may also be an anonymous
+    // operand, which has a single operand, but no declared class for the
+    // operand.
+    DagInit *MIOI = Op.MIOperandInfo;
+
+    if (!MIOI || MIOI->getNumArgs() == 0) {
+      Res = std::to_string(Op.MIOperandNo) + ", " + Op.OperandType + ", 1";
+    } else {
+      Res = std::to_string(Op.MIOperandNo) + ", " + Namespace +
+            "::MIOpTypes::" + Op.Rec->getName().str() + ", " +
+            std::to_string(Op.MINumOperands);
+    }
+
+    Result.push_back(Res);
+  }
+
+  return Result;
+}
+
+void InstrInfoEmitter::EmitMIOperandInfo(raw_ostream &OS,
+                                         OperandInfoMapTy &MIOperandInfoIDs) {
+  // ID #0 is for no operand info.
+  unsigned OperandListNum = 0;
+  MIOperandInfoIDs[std::vector<std::string>()] = ++OperandListNum;
+
+  OS << "\n";
+  const CodeGenTarget &Target = CDP.getTargetInfo();
+  for (const CodeGenInstruction *Inst : Target.getInstructionsByEnumValue()) {
+    std::vector<std::string> OperandInfo = GetMIOperandInfo(Target, *Inst);
+    unsigned &N = MIOperandInfoIDs[OperandInfo];
+    if (N != 0)
+      continue;
+
+    N = ++OperandListNum;
+    OS << "static const MIOperandInfo MIOperandInfo" << N << "[] = { ";
+    for (const std::string &Info : OperandInfo)
+      OS << "{ " << Info << " }, ";
+    OS << "};\n";
+  }
+}
+
+std::vector<std::string>
+InstrInfoEmitter::GetMCOperandInfo(const CodeGenInstruction &Inst) {
   std::vector<std::string> Result;
 
   for (auto &Op : Inst.Operands) {
@@ -190,21 +250,21 @@ InstrInfoEmitter::GetOperandInfo(const CodeGenInstruction &Inst) {
   return Result;
 }
 
-void InstrInfoEmitter::EmitOperandInfo(raw_ostream &OS,
-                                       OperandInfoMapTy &OperandInfoIDs) {
+void InstrInfoEmitter::EmitMCOperandInfo(raw_ostream &OS,
+                                         OperandInfoMapTy &MCOperandInfoIDs) {
   // ID #0 is for no operand info.
   unsigned OperandListNum = 0;
-  OperandInfoIDs[std::vector<std::string>()] = ++OperandListNum;
+  MCOperandInfoIDs[std::vector<std::string>()] = ++OperandListNum;
 
   OS << "\n";
   const CodeGenTarget &Target = CDP.getTargetInfo();
   for (const CodeGenInstruction *Inst : Target.getInstructionsByEnumValue()) {
-    std::vector<std::string> OperandInfo = GetOperandInfo(*Inst);
-    unsigned &N = OperandInfoIDs[OperandInfo];
+    std::vector<std::string> OperandInfo = GetMCOperandInfo(*Inst);
+    unsigned &N = MCOperandInfoIDs[OperandInfo];
     if (N != 0) continue;
 
     N = ++OperandListNum;
-    OS << "static const MCOperandInfo OperandInfo" << N << "[] = { ";
+    OS << "static const MCOperandInfo MCOperandInfo" << N << "[] = { ";
     for (const std::string &Info : OperandInfo)
       OS << "{ " << Info << " }, ";
     OS << "};\n";
@@ -212,7 +272,7 @@ void InstrInfoEmitter::EmitOperandInfo(raw_ostream &OS,
 }
 
 /// Initialize data structures for generating operand name mappings.
-/// 
+///
 /// \param Operands [out] A map used to generate the OpName enum with operand
 ///        names as its keys and operand enum values as its values.
 /// \param OperandMap [out] A map for representing the operand name mappings for
@@ -331,25 +391,23 @@ void InstrInfoEmitter::emitOperandTypesEnum(raw_ostream &OS,
   StringRef Namespace = Target.getInstNamespace();
   std::vector<Record *> Operands = Records.getAllDerivedDefinitions("Operand");
 
-  OS << "#ifdef GET_INSTRINFO_OPERAND_TYPES_ENUM\n";
-  OS << "#undef GET_INSTRINFO_OPERAND_TYPES_ENUM\n";
-  OS << "namespace llvm {\n";
   OS << "namespace " << Namespace << " {\n";
-  OS << "namespace OpTypes {\n";
-  OS << "enum OperandType {\n";
+  OS << "namespace MIOpTypes {\n";
+  OS << "enum MIOperandType {\n";
 
-  unsigned EnumVal = 0;
+  bool First = true;
   for (const Record *Op : Operands) {
-    if (!Op->isAnonymous())
-      OS << "  " << Op->getName() << " = " << EnumVal << ",\n";
-    ++EnumVal;
+    OS << "  " << Op->getName();
+    if (First) {
+      OS << " = llvm::MCOI::OPERAND_FIRST_TARGET";
+      First = false;
+    }
+    OS << ",\n";
   }
 
   OS << "  OPERAND_TYPE_LIST_END" << "\n};\n";
   OS << "} // end namespace OpTypes\n";
   OS << "} // end namespace " << Namespace << "\n";
-  OS << "} // end namespace llvm\n";
-  OS << "#endif // GET_INSTRINFO_OPERAND_TYPES_ENUM\n\n";
 }
 
 void InstrInfoEmitter::emitMCIIHelperMethods(raw_ostream &OS,
@@ -437,10 +495,22 @@ void InstrInfoEmitter::run(raw_ostream &OS) {
   emitSourceFileHeader("Target Instruction Enum Values and Descriptors", OS);
   emitEnums(OS);
 
+  // Get the MI types separately from data
+  OS << "#ifdef GET_INSTRINFO_MI_OPS_INFO\n";
+  OS << "#undef GET_INSTRINFO_MI_OPS_INFO\n";
+  OS << "namespace llvm {\n\n";
+
+  emitOperandTypesEnum(OS, CDP.getTargetInfo());
+
+  OS << "} // end llvm namespace\n";
+  OS << "#endif // GET_INSTRINFO_MI_OPS_INFO\n\n";
+
   OS << "#ifdef GET_INSTRINFO_MC_DESC\n";
   OS << "#undef GET_INSTRINFO_MC_DESC\n";
 
   OS << "namespace llvm {\n\n";
+
+  emitOperandTypesEnum(OS, CDP.getTargetInfo());
 
   CodeGenTarget &Target = CDP.getTargetInfo();
   const std::string &TargetName = Target.getName();
@@ -465,10 +535,12 @@ void InstrInfoEmitter::run(raw_ostream &OS) {
     }
   }
 
-  OperandInfoMapTy OperandInfoIDs;
+  OperandInfoMapTy MIOperandInfoIDs;
+  OperandInfoMapTy MCOperandInfoIDs;
 
   // Emit all of the operand info records.
-  EmitOperandInfo(OS, OperandInfoIDs);
+  EmitMIOperandInfo(OS, MIOperandInfoIDs);
+  EmitMCOperandInfo(OS, MCOperandInfoIDs);
 
   // Emit all of the MCInstrDesc records in their ENUM ordering.
   //
@@ -482,7 +554,9 @@ void InstrInfoEmitter::run(raw_ostream &OS) {
     // Keep a list of the instruction names.
     InstrNames.add(Inst->TheDef->getName());
     // Emit the record into the table.
-    emitRecord(*Inst, Num++, InstrInfo, EmittedLists, OperandInfoIDs, OS);
+    emitRecord(
+        *Inst, Num++, InstrInfo, EmittedLists,
+        MIOperandInfoIDs, MCOperandInfoIDs, OS);
   }
   OS << "};\n\n";
 
@@ -561,24 +635,27 @@ void InstrInfoEmitter::run(raw_ostream &OS) {
 
   emitOperandNameMappings(OS, Target, NumberedInstructions);
 
-  emitOperandTypesEnum(OS, Target);
-
   emitMCIIHelperMethods(OS, TargetName);
 }
 
 void InstrInfoEmitter::emitRecord(const CodeGenInstruction &Inst, unsigned Num,
                                   Record *InstrInfo,
-                         std::map<std::vector<Record*>, unsigned> &EmittedLists,
-                                  const OperandInfoMapTy &OpInfo,
+                         std::map<std::vector<Record *>, unsigned> &EmittedLists,
+                                  const OperandInfoMapTy &MIOpInfo,
+                                  const OperandInfoMapTy &MCOpInfo,
                                   raw_ostream &OS) {
   int MinOperands = 0;
-  if (!Inst.Operands.empty())
+  if (!Inst.Operands.empty()) {
+
     // Each logical operand can be multiple MI operands.
     MinOperands = Inst.Operands.back().MIOperandNo +
                   Inst.Operands.back().MINumOperands;
+  }
 
   OS << "  { ";
-  OS << Num << ",\t" << MinOperands << ",\t"
+  OS << Num << ",\t"
+     << Inst.Operands.size() << ",\t"
+     << MinOperands << ",\t"
      << Inst.Operands.NumDefs << ",\t"
      << Inst.TheDef->getValueAsInt("Size") << ",\t"
      << SchedModels.getSchedClassIdx(Inst) << ",\t0";
@@ -655,11 +732,19 @@ void InstrInfoEmitter::emitRecord(const CodeGenInstruction &Inst, unsigned Num,
     OS << "ImplicitList" << EmittedLists[DefList] << ", ";
 
   // Emit the operand info.
-  std::vector<std::string> OperandInfo = GetOperandInfo(Inst);
-  if (OperandInfo.empty())
+  std::vector<std::string> MIOperandInfo =
+      GetMIOperandInfo(CDP.getTargetInfo(), Inst);
+  if (MIOperandInfo.empty())
     OS << "nullptr";
   else
-    OS << "OperandInfo" << OpInfo.find(OperandInfo)->second;
+    OS << "MIOperandInfo" << MIOpInfo.find(MIOperandInfo)->second;
+  OS << ", ";
+
+  std::vector<std::string> MCOperandInfo = GetMCOperandInfo(Inst);
+  if (MCOperandInfo.empty())
+    OS << "nullptr";
+  else
+    OS << "MCOperandInfo" << MCOpInfo.find(MCOperandInfo)->second;
 
   if (Inst.HasComplexDeprecationPredicate)
     // Emit a function pointer to the complex predicate method.
